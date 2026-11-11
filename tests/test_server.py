@@ -156,8 +156,9 @@ def test_invalid_lifespan():
 def test_installed_entrypoint_discovery(tmp_path):
     (tmp_path / "test_discovery.py").write_text(
         textwrap.dedent("""
-        def test_discovery(stream_server):
+        def test_discovery(stream_server, stream_probe):
             assert callable(stream_server)
+            assert stream_probe.started_count
     """)
     )
     result = subprocess.run(
@@ -333,16 +334,22 @@ def test_repeated_cancellation_during_shutdown_waits_for_cleanup():
                 return server.url
 
         host_task = asyncio.create_task(host())
-        await asyncio.wait_for(entered.wait(), timeout=1)
-        host_task.cancel("first")
-        await asyncio.sleep(0)
-        host_task.cancel("second")
-        await asyncio.sleep(0)
-        assert not host_task.done()
-        release.set()
-        with pytest.raises(asyncio.CancelledError, match="first"):
-            await asyncio.wait_for(host_task, timeout=1)
-        assert finished.is_set()
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=3)
+            host_task.cancel("first")
+            await asyncio.sleep(0)
+            host_task.cancel("second")
+            await asyncio.sleep(0)
+            assert not host_task.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError, match="first"):
+                await asyncio.wait_for(host_task, timeout=1)
+            assert finished.is_set()
+        finally:
+            release.set()
+            if not host_task.done():
+                host_task.cancel()
+            await asyncio.gather(host_task, return_exceptions=True)
 
     run(scenario())
 
@@ -404,7 +411,9 @@ def test_forced_shutdown_closes_idle_accepted_connection_only(monkeypatch):
     run(scenario())
 
 
-def test_finalizer_exception_is_reported_on_forced_shutdown():
+@pytest.mark.parametrize("body_fails", [False, True])
+@pytest.mark.parametrize("grouped", [False, True])
+def test_finalizer_exception_is_reported_on_forced_shutdown(body_fails, grouped):
     async def scenario():
         entered = asyncio.Event()
         loop_errors = []
@@ -420,14 +429,28 @@ def test_finalizer_exception_is_reported_on_forced_shutdown():
             try:
                 await asyncio.Event().wait()
             finally:
-                raise RuntimeError("shutdown finalizer exploded")
+                try:
+                    raise ValueError("shutdown root cause")
+                except ValueError as cause:
+                    error = RuntimeError("shutdown finalizer exploded")
+                    error.add_note("shutdown finalizer note")
+                    error.__cause__ = cause
+                    if grouped:
+                        raise ExceptionGroup("shutdown group", [ExceptionGroup("inner", [error])])
+                    raise error
 
         try:
-            with pytest.raises(ServerError, match="shutdown timed out") as caught:
+            expected = ValueError if body_fails else ServerError
+            message = "body failure" if body_fails else "shutdown timed out"
+            with pytest.raises(expected, match=message) as caught:
                 async with live_server(app, shutdown_timeout=0.5):
-                    pass
+                    if body_fails:
+                        raise ValueError("body failure")
             assert entered.is_set()
-            assert any("shutdown finalizer exploded" in note for note in caught.value.__notes__)
+            notes = " ".join(caught.value.__notes__)
+            assert "shutdown finalizer exploded" in notes
+            assert "shutdown finalizer note" in notes
+            assert "shutdown root cause" in notes
             await asyncio.sleep(0)
             assert not any(
                 "never retrieved" in context.get("message", "") for context in loop_errors
@@ -549,5 +572,103 @@ def test_primary_exception_preserves_server_task_failure_detail(monkeypatch, pri
         with pytest.raises(expected) as caught:
             await asyncio.wait_for(host_task, timeout=2)
         assert any("actual server failure detail" in note for note in caught.value.__notes__)
+
+    run(scenario())
+
+
+def test_shutdown_budget_allows_poll_and_scheduler_overhead(monkeypatch):
+    from starlette.responses import StreamingResponse
+
+    import pytest_stream_lifecycle.server as server_module
+
+    async def scenario():
+        active = asyncio.Event()
+        cleaned = asyncio.Event()
+
+        class DelayedServer(server_module._Server):
+            async def main_loop(self):
+                while not self.should_exit:
+                    await asyncio.sleep(0.01)
+                # Model the main-loop polling and scheduling overhead.
+                await asyncio.sleep(0.1)
+
+            async def shutdown(self, sockets=None):
+                await asyncio.sleep(0.05)
+                await super().shutdown(sockets=sockets)
+
+        monkeypatch.setattr(server_module, "_Server", DelayedServer)
+
+        async def body():
+            try:
+                yield b"start\n"
+                active.set()
+                await asyncio.Event().wait()
+            finally:
+                cleaned.set()
+
+        async def endpoint(request):
+            return StreamingResponse(body())
+
+        app = Starlette(routes=[Route("/", endpoint)])
+        async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
+            async with live_server(app, shutdown_timeout=1) as server:
+                response_context = client.stream("GET", server.url)
+                response = await response_context.__aenter__()
+                chunks = response.aiter_bytes()
+                assert await asyncio.wait_for(anext(chunks), 1) == b"start\n"
+                await asyncio.wait_for(active.wait(), 1)
+                started = asyncio.get_running_loop().time()
+            assert cleaned.is_set()
+            assert asyncio.get_running_loop().time() - started < 1.5
+            await response_context.__aexit__(None, None, None)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("server_fails", [False, True])
+def test_stop_preserves_all_owned_task_failures(server_fails):
+    import socket
+    from types import SimpleNamespace
+
+    from pytest_stream_lifecycle.server import _stop
+
+    async def scenario():
+        async def failing_task(message):
+            try:
+                raise ValueError(f"{message} cause")
+            except ValueError as cause:
+                error = RuntimeError(message)
+                error.add_note(f"{message} note")
+                raise error from cause
+
+        owned = [asyncio.create_task(failing_task(f"owned {i}")) for i in (1, 2)]
+        await asyncio.wait(owned)
+        errors = [task.exception() for task in owned]
+        assert all(errors)
+        if server_fails:
+            server_task = asyncio.create_task(failing_task("server failure"))
+        else:
+            server_task = asyncio.create_task(asyncio.sleep(0))
+        await asyncio.wait({server_task})
+        server = SimpleNamespace(
+            should_exit=False,
+            force_exit=False,
+            servers=(),
+            server_state=SimpleNamespace(connections=set()),
+        )
+        with socket.socket() as sock, pytest.raises(ServerError) as caught:
+            await _stop(server, server_task, sock, set(), 1, errors)
+        error = caught.value
+        if server_fails:
+            assert isinstance(error.__cause__, RuntimeError)
+            assert str(error.__cause__) == "server failure"
+        else:
+            assert error.__cause__ is errors[0]
+        details = f"{error!r} {error.__cause__!r} {' '.join(error.__notes__)}"
+        if server_fails:
+            for detail in ("owned 1", "owned 1 note", "owned 1 cause"):
+                assert detail in details
+        for detail in ("owned 2", "owned 2 note", "owned 2 cause"):
+            assert detail in details
 
     run(scenario())

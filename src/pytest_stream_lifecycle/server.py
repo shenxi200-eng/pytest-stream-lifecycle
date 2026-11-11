@@ -16,6 +16,8 @@ from typing import Any, Literal
 
 import uvicorn
 
+from ._errors import add_exception_notes
+
 ASGIApp = Callable[..., Any]
 Lifespan = Literal["on", "off", "auto"]
 
@@ -29,6 +31,22 @@ class ServerHandle:
     """Address of a running HTTP server."""
 
     url: str
+
+    def sse(self, path: str, *, method: str = "GET", timeout: float = 2.0, **request_kwargs: Any):
+        """Open a bounded SSE reader over the server's real HTTP socket."""
+        from .streams import open_stream
+
+        return open_stream(
+            self.url, path, kind="sse", method=method, timeout=timeout, **request_kwargs
+        )
+
+    def lines(self, path: str, *, method: str = "GET", timeout: float = 2.0, **request_kwargs: Any):
+        """Open a bounded line reader over the server's real HTTP socket."""
+        from .streams import open_stream
+
+        return open_stream(
+            self.url, path, kind="lines", method=method, timeout=timeout, **request_kwargs
+        )
 
 
 class _Config(uvicorn.Config):
@@ -105,17 +123,22 @@ async def _stop(
                     error = completed_task.exception()
                     if error is not None and error not in task_errors:
                         task_errors.append(error)
-        if done and not task.cancelled():
-            exc = task.exception()
-            if exc is not None:
-                raise ServerError("server failed while running or shutting down") from exc
+        server_error = task.exception() if done and not task.cancelled() else None
+        if server_error is not None:
+            error = ServerError("server failed while running or shutting down")
+            for secondary in task_errors:
+                add_exception_notes(error, "Owned task cleanup failure", secondary)
+            raise error from server_error
         if timed_out:
             error = ServerError(f"server shutdown timed out after {timeout:g}s")
             for secondary in task_errors:
-                error.add_note(f"Owned task cleanup failed: {secondary!r}")
+                add_exception_notes(error, "Owned task cleanup failure", secondary)
             raise error
         if task_errors:
-            raise ServerError(f"owned task cleanup failed: {task_errors[0]!r}") from task_errors[0]
+            error = ServerError(f"owned task cleanup failed: {task_errors[0]!r}")
+            for secondary in task_errors[1:]:
+                add_exception_notes(error, "Additional owned task failure", secondary)
+            raise error from task_errors[0]
     finally:
         # Uvicorn's asyncio.Server normally owns the supplied socket. If its
         # serve task was cancelled mid-shutdown, close its listener explicitly
@@ -215,7 +238,12 @@ async def live_server(
             access_log=False,
             http="h11",
             ws="none",
-            timeout_graceful_shutdown=shutdown_timeout * 0.6,
+            # Uvicorn also polls in main_loop and sleeps before waiting for
+            # active connections. Reserve fixed time for those phases and
+            # scheduler jitter, in addition to our cancellation reserve.
+            timeout_graceful_shutdown=min(
+                shutdown_timeout * 0.4, max(0.0, shutdown_timeout * 0.8 - 0.3)
+            ),
         )
         server = _Server(config)
 
@@ -253,7 +281,10 @@ async def live_server(
                 if lifespan_failure is not None:
                     detail = f"application lifespan failed after startup: {lifespan_failure}"
                     if cleanup_error is not None:
-                        cleanup_error.add_note(detail)
+                        if isinstance(lifespan_failure, BaseException):
+                            add_exception_notes(cleanup_error, detail, lifespan_failure)
+                        else:
+                            cleanup_error.add_note(detail)
                     elif isinstance(lifespan_failure, BaseException):
                         raise ServerError(detail) from lifespan_failure
                     else:
@@ -276,22 +307,7 @@ async def live_server(
             if cleanup_error is not None:
                 if primary is None:
                     raise cleanup_error
-                # Preserve secondary failure chains and notes without replacing
-                # the body exception or cancellation. Guard malformed cycles.
-                seen: set[int] = set()
-                pending = [cleanup_error]
-                while pending:
-                    secondary = pending.pop()
-                    if secondary is primary or id(secondary) in seen:
-                        continue
-                    seen.add(id(secondary))
-                    primary.add_note(f"Server cleanup failure: {secondary!r}")
-                    for note in getattr(secondary, "__notes__", ()):
-                        primary.add_note(note)
-                    if secondary.__cause__ is not None:
-                        pending.append(secondary.__cause__)
-                    if secondary.__context__ is not None:
-                        pending.append(secondary.__context__)
+                add_exception_notes(primary, "Server cleanup failure", cleanup_error)
             if failure is None and interrupted is not None:
                 raise interrupted
         else:

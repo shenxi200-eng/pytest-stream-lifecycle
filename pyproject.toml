@@ -30,7 +30,7 @@ Source = "https://github.com/shenxi200-eng/pytest-stream-lifecycle"
 Issues = "https://github.com/shenxi200-eng/pytest-stream-lifecycle/issues"
 
 [project.optional-dependencies]
-dev = ["ruff", "build", "twine", "pytest-cov", "starlette"]
+dev = ["ruff", "build", "twine", "pytest-cov", "starlette", "fastapi", "sse-starlette"]
 
 [project.entry-points.pytest11]
 stream_lifecycle = "pytest_stream_lifecycle.plugin"
@@ -40,4 +40,4 @@ target-version = "py311"
 line-length = 100
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "examples"]

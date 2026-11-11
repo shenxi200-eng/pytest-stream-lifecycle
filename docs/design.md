@@ -26,7 +26,7 @@ application lifecycle probes. It makes no claim to be the first or only tool
 in this space. Use existing parsers and transports rather than reimplementing
 protocols. Avoid a general testing platform.
 
-## Milestones
+## Implemented contracts
 
 1. Installable pytest entry point; bounded loopback ASGI server; startup,
    shutdown, failure and socket-release tests; CI and packaging checks.
@@ -36,9 +36,15 @@ protocols. Avoid a general testing platform.
      observation, and separately require upstream cleanup when instrumented;
    - repeat independently instrumented sessions without hiding outstanding work;
    - report timeouts as failures, never silently classify unknown cleanup as OK.
-3. Comparative examples showing what a body-only assertion misses, plus
-   integration and repeatability checks. No performance or adoption claims
-   without measurement.
+3. Executable FastAPI/sse-starlette comparisons showing what a body-only
+   assertion misses, explicit leak detection before fixture teardown, and
+   20-session checks. No performance or adoption claims without measurement.
+
+Cleanup observations require both scope exit and explicit `mark_closed()` after
+successful cleanup. Merely entering a `finally` block is not enough: cancellation
+can interrupt its awaited work. Unknown labels and unacknowledged exits never
+count as success. The probe records only instrumented instances, not every task
+in the process. See the [API guide](api.md) for exact semantics.
 
 ## Implementation constraints
 
