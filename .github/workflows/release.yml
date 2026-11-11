@@ -1,0 +1,152 @@
+name: Release preparation
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Check only, publish to TestPyPI, or publish to PyPI"
+        type: choice
+        options:
+          - check
+          - testpypi
+          - pypi
+        default: check
+        required: true
+
+permissions:
+  contents: read
+
+# Distinct from the reusable CI workflow's concurrency group. Do not cancel
+# a release while a build or publication is in progress.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Validate target and publication ref
+        env:
+          RELEASE_TARGET: ${{ inputs.target }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TARGET" in
+            check) exit 0 ;;
+            testpypi|pypi) ;;
+            *) echo 'Invalid release target' >&2; exit 1 ;;
+          esac
+          if [[ "$RELEASE_REPOSITORY" != 'shenxi200-eng/pytest-stream-lifecycle' ]]; then
+            echo 'Publication is restricted to the canonical repository' >&2
+            exit 1
+          fi
+          version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])')"
+          if [[ "$RELEASE_REF" != "refs/tags/v${version}" ]]; then
+            echo 'Publication requires the exact v{project.version} tag' >&2
+            exit 1
+          fi
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          if ! git merge-base --is-ancestor "$RELEASE_SHA" refs/remotes/origin/main; then
+            echo 'The tagged commit must be an ancestor of origin/main' >&2
+            exit 1
+          fi
+
+  tests:
+    needs: validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: [validate, tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Build isolated distributions and check metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install build twine
+          dist_dir="$(mktemp -d "$RUNNER_TEMP/release-dist.XXXXXX")"
+          echo "DIST_DIR=$dist_dir" >> "$GITHUB_ENV"
+          python -m build --outdir "$dist_dir"
+          python -m twine check --strict "$dist_dir"/*
+          shopt -s nullglob
+          wheels=("$dist_dir"/*.whl)
+          sdists=("$dist_dir"/*.tar.gz)
+          (( ${#wheels[@]} == 1 && ${#sdists[@]} == 1 )) || { echo 'Expected one wheel and one sdist' >&2; exit 1; }
+          sha256sum "${wheels[0]}" "${sdists[0]}"
+      - name: Test the built wheel in a fresh virtual environment
+        env:
+          PYTHONPATH: ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=("$DIST_DIR"/*.whl)
+          (( ${#wheels[@]} == 1 ))
+          python -m venv "$RUNNER_TEMP/release-wheel-venv"
+          python="$RUNNER_TEMP/release-wheel-venv/bin/python"
+          "$python" -m pip install "${wheels[0]}[dev]"
+          "$python" -c 'import pathlib, sysconfig, pytest_stream_lifecycle as p; module = pathlib.Path(p.__file__).resolve(); site = pathlib.Path(sysconfig.get_paths()["purelib"]).resolve(); print(f"Wheel module: {module}"); assert module.is_relative_to(site), "Package was not imported from the wheel environment"'
+          "$python" -m pytest -q
+      - name: Upload verified distributions
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-distributions
+          path: ${{ env.DIST_DIR }}/*
+          if-no-files-found: error
+
+  publish-testpypi:
+    if: inputs.target == 'testpypi'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-distributions
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          attestations: true
+
+  publish-pypi:
+    if: inputs.target == 'pypi'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-distributions
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          repository-url: https://upload.pypi.org/legacy/
+          attestations: true

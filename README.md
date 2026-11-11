@@ -20,6 +20,9 @@ The SSE parser is [httpx-sse](https://github.com/florimondmanca/httpx-sse).
 
 ## Install
 
+The first PyPI release is being prepared as `0.1.0a1`; it is not uploaded yet.
+Maintainers can follow the [release checklist](docs/releasing.md).
+
 Install the current source in your test environment:
 
 ```sh

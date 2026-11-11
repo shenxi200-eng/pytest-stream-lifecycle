@@ -5,12 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "pytest-stream-lifecycle"
 version = "0.1.0a1"
-description = "Real HTTP server fixtures for testing streaming ASGI applications"
+description = "Real-network streaming and explicit cleanup assertions for ASGI tests"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
+keywords = ["pytest", "asgi", "sse", "streaming", "testing"]
 classifiers = [
+  "Development Status :: 3 - Alpha",
   "Framework :: Pytest",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
@@ -26,6 +28,7 @@ dependencies = [
 ]
 
 [project.urls]
+Documentation = "https://github.com/shenxi200-eng/pytest-stream-lifecycle/blob/main/docs/api.md"
 Source = "https://github.com/shenxi200-eng/pytest-stream-lifecycle"
 Issues = "https://github.com/shenxi200-eng/pytest-stream-lifecycle/issues"
 
