@@ -2,7 +2,7 @@
 
 Test streaming delivery and disconnect cleanup over real loopback HTTP.
 
-**Experimental. Python 3.11+, asyncio. Not published to PyPI yet.**
+**Experimental alpha. Python 3.11+, asyncio.**
 No GPU, model API credentials, or external service is needed.
 
 ## What it catches
@@ -20,14 +20,19 @@ The SSE parser is [httpx-sse](https://github.com/florimondmanca/httpx-sse).
 
 ## Install
 
-The first PyPI release is being prepared as `0.1.0a1`; it is not uploaded yet.
-Maintainers can follow the [release checklist](docs/releasing.md).
+Install the experimental alpha in your test environment:
 
-Install the current source in your test environment:
+```sh
+python -m pip install pytest-stream-lifecycle==0.1.0a1
+```
+
+To install the current source instead:
 
 ```sh
 python -m pip install 'git+https://github.com/shenxi200-eng/pytest-stream-lifecycle.git'
 ```
+
+Maintainers can follow the [release checklist](https://github.com/shenxi200-eng/pytest-stream-lifecycle/blob/main/docs/releasing.md).
 
 For the example below, also install `fastapi` and `sse-starlette`. These are
 example/development dependencies, not plugin runtime requirements. Installation
@@ -119,8 +124,8 @@ the defect was **detected**, not that the intentionally broken app is correct.
 - A local cleanup marker does not prove remote cancellation, GPU work cessation,
   or a provider's billing state.
 
-See the [API guide](docs/api.md), [design and related work](docs/design.md), and
-[contribution guide](CONTRIBUTING.md). Development uses AI-assisted implementation
+See the [API guide](https://github.com/shenxi200-eng/pytest-stream-lifecycle/blob/main/docs/api.md), [design and related work](https://github.com/shenxi200-eng/pytest-stream-lifecycle/blob/main/docs/design.md), and
+[contribution guide](https://github.com/shenxi200-eng/pytest-stream-lifecycle/blob/main/CONTRIBUTING.md). Development uses AI-assisted implementation
 and review; generated code and claims must be checked rather than treated as
 verification evidence. AI-assisted contributions have the same testing and review
 requirements as other contributions.
