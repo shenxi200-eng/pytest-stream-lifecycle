@@ -218,12 +218,24 @@ def test_status_content_type_eof_paths_and_close():
 
 def test_connection_failure_and_body_exception():
     async def scenario():
+        import socket
+
         from pytest_stream_lifecycle.server import ServerHandle
 
-        handle = ServerHandle("http://127.0.0.1:1")
-        with pytest.raises(LifecycleError, match="request failed"):
-            async with handle.lines("/", timeout=0.2):
-                pass
+        # Reserve a local port without listening: no third-party service can
+        # answer it, and platforms may report refusal or let connect time out.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reserved:
+            reserved.bind(("127.0.0.1", 0))
+            port = reserved.getsockname()[1]
+            handle = ServerHandle(f"http://127.0.0.1:{port}")
+            started = asyncio.get_running_loop().time()
+            with pytest.raises(
+                LifecycleError, match="request failed|connection timed out"
+            ) as caught:
+                async with handle.lines("/", timeout=0.2):
+                    pass
+            assert isinstance(caught.value.__cause__, (httpx.ConnectError, TimeoutError))
+            assert asyncio.get_running_loop().time() - started < 2
 
         async def endpoint(request):
             return PlainTextResponse("hi")
@@ -440,5 +452,40 @@ def test_grouped_stream_cleanup_preserves_nested_evidence_and_body(monkeypatch):
                 )
                 == 1
             )
+
+    run(scenario())
+
+
+def test_injected_connect_error_preserves_cause_and_closes_client(monkeypatch):
+    import pytest_stream_lifecycle.streams as streams_module
+
+    instances = []
+    cause = httpx.ConnectError("injected connection refusal")
+
+    class RequestContext:
+        async def __aenter__(self):
+            raise cause
+
+        async def __aexit__(self, *args):
+            raise AssertionError("an unentered request must not be exited")
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.closed = False
+            instances.append(self)
+
+        def stream(self, *args, **kwargs):
+            return RequestContext()
+
+        async def aclose(self):
+            self.closed = True
+
+    async def scenario():
+        monkeypatch.setattr(streams_module.httpx, "AsyncClient", Client)
+        with pytest.raises(LifecycleError, match="request failed") as caught:
+            async with streams_module.open_stream("http://127.0.0.1", "/", kind="lines"):
+                pass
+        assert caught.value.__cause__ is cause
+        assert len(instances) == 1 and instances[0].closed
 
     run(scenario())
