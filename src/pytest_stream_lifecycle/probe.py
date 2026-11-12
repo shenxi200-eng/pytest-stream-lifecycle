@@ -134,7 +134,9 @@ class LifecycleProbe:
         while True:
             unknown = [name for name in names if not self._entries.get(name)]
             active = [name for name in names if any(e.active for e in self._entries.get(name, ()))]
-            failed = [e for name in names for e in self._entries.get(name, ()) if e.failure]
+            failed = [
+                e for name in names for e in self._entries.get(name, ()) if e.failure is not None
+            ]
             unacknowledged = [
                 name
                 for name in names

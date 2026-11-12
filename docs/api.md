@@ -44,8 +44,17 @@ async with server.lines("/jsonl", headers={"X-Test": "yes"}) as stream:
   EOF is an error for `next()`, not an end-of-stream assertion API.
 - A timed-out reader is closed, not reusable. Keep one reader context open for
   multiple `next()` calls. Concurrent reads on the same reader are rejected.
-- `await stream.aclose()` is idempotent. Context exit also closes the reader.
-  Client closure is deliberately separate from server-side cleanup assertions.
+- `await stream.aclose()` and context exit share one cleanup operation. Closing
+  during a pending read cancels and joins the owned iterator operation, not the
+  caller's whole task; an interrupted `next()` raises cancellation or its read failure.
+  Overlapping closes wait for cleanup, and later closes observe the same result,
+  including any cleanup failure. Cleanup steps are not repeated.
+- Caller cancellation during close is deferred until cleanup completes, even
+  with repeated cancellation. Cleanup failures are retained alongside a primary
+  read/body error or caller cancellation. Reads and cleanup require cooperative
+  async code: an iterator that suppresses cancellation can delay close beyond
+  the read timeout. Client closure is still separate from server-side cleanup
+  assertions.
 
 ## Lifecycle probe
 

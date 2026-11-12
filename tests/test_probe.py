@@ -161,3 +161,21 @@ def test_generator_exit_with_acknowledged_cleanup():
         await probe.wait_closed("producer")
 
     run(scenario())
+
+
+def test_falsy_failure_is_retained_after_cleanup_acknowledgement():
+    class FalsyFailure(RuntimeError):
+        def __bool__(self):
+            return False
+
+    async def scenario():
+        probe = LifecycleProbe()
+        failure = FalsyFailure("acknowledged but failed")
+        with pytest.raises(FalsyFailure), probe.track("resource") as observed:
+            observed.mark_closed()
+            raise failure
+        with pytest.raises(LifecycleError, match="acknowledged but failed") as caught:
+            await probe.wait_closed("resource")
+        assert caught.value.__cause__ is failure
+
+    run(scenario())

@@ -23,7 +23,7 @@ The SSE parser is [httpx-sse](https://github.com/florimondmanca/httpx-sse).
 Install the experimental alpha in your test environment:
 
 ```sh
-python -m pip install pytest-stream-lifecycle==0.1.0a1
+python -m pip install pytest-stream-lifecycle==0.1.0a2
 ```
 
 To install the current source instead:

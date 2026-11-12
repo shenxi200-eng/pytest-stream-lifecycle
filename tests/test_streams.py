@@ -489,3 +489,614 @@ def test_injected_connect_error_preserves_cause_and_closes_client(monkeypatch):
         assert len(instances) == 1 and instances[0].closed
 
     run(scenario())
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "text/event-stream",
+        "Text/Event-Stream",
+        "text/event-stream; charset=UTF-8",
+        "Text/Event-Stream; charset=UTF-8; custom=Preserved",
+    ],
+)
+def test_sse_content_type_is_case_insensitive_and_preserves_parameters(content_type):
+    async def app(scope, receive, send):
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", content_type.encode("ascii"))],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"data: first\n\n"})
+
+    async def scenario():
+        async with live_server(app, lifespan="off") as server, server.sse("/") as stream:
+            assert (await stream.next()).data == "first"
+            assert (
+                stream._response.headers["content-type"].partition(";")[1:]
+                == content_type.partition(";")[1:]
+            )
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("iterator_kind", ["async-generator", "sync-returned-awaitable"])
+def test_close_during_pending_read_cancels_only_owned_operation(iterator_kind):
+    from pytest_stream_lifecycle.streams import Stream
+
+    async def scenario():
+        entered = asyncio.Event()
+        reader_stopped = asyncio.Event()
+        release_caller = asyncio.Event()
+        operations = set()
+        steps = []
+
+        async def read_operation():
+            operations.add(asyncio.current_task())
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                steps.append("read finalizer")
+
+        async def generator():
+            await read_operation()
+            yield "late"
+
+        class Awaitable:
+            def __await__(self):
+                return read_operation().__await__()
+
+        class Iterator:
+            def __anext__(self):
+                return Awaitable()
+
+            async def aclose(self):
+                steps.append("iterator close")
+
+        class ResponseContext:
+            async def __aexit__(self, *args):
+                steps.append("response close")
+
+        class Client:
+            async def aclose(self):
+                steps.append("client close")
+
+        iterator = generator() if iterator_kind == "async-generator" else Iterator()
+        stream = Stream(Client(), ResponseContext(), None, iterator, 5, "pending")
+
+        async def caller():
+            try:
+                await stream.next()
+            except asyncio.CancelledError:
+                reader_stopped.set()
+            # The caller has work unrelated to the owned read. Closing the
+            # stream must not cancel this whole task or its later work.
+            await release_caller.wait()
+            return "caller survived"
+
+        caller_task = asyncio.create_task(caller())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            await asyncio.wait_for(stream.aclose(), timeout=1)
+            await asyncio.wait_for(reader_stopped.wait(), timeout=1)
+            assert caller_task.cancelling() == 0 and not caller_task.done()
+            assert all(task.done() for task in operations)
+            expected = ["read finalizer"]
+            if iterator_kind != "async-generator":
+                expected.append("iterator close")
+            assert steps == [*expected, "response close", "client close"]
+            await stream.aclose()
+            assert steps == [*expected, "response close", "client close"]
+            release_caller.set()
+            assert await asyncio.wait_for(caller_task, timeout=1) == "caller survived"
+            with pytest.raises(LifecycleError, match="closed"):
+                await stream.next()
+        finally:
+            release_caller.set()
+            if not caller_task.done():
+                caller_task.cancel()
+            await asyncio.gather(caller_task, return_exceptions=True)
+            await asyncio.gather(stream.aclose(), return_exceptions=True)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_overlapping_closes_wait_for_one_cleanup(cleanup_fails):
+    from pytest_stream_lifecycle.streams import Stream
+
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        second_entered = asyncio.Event()
+        steps = []
+        cleanup_error = RuntimeError("shared cleanup failure")
+
+        class Iterator:
+            async def aclose(self):
+                steps.append("iterator close")
+                entered.set()
+                await release.wait()
+                if cleanup_fails:
+                    raise cleanup_error
+
+        class ResponseContext:
+            async def __aexit__(self, *args):
+                steps.append("response close")
+
+        class Client:
+            async def aclose(self):
+                steps.append("client close")
+
+        stream = Stream(Client(), ResponseContext(), None, Iterator(), 1, "overlap")
+
+        async def second_close():
+            second_entered.set()
+            await stream.aclose()
+
+        closers = [asyncio.create_task(stream.aclose())]
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            closers.append(asyncio.create_task(second_close()))
+            await asyncio.wait_for(second_entered.wait(), timeout=1)
+            assert not any(task.done() for task in closers)
+            release.set()
+            outcomes = await asyncio.wait_for(
+                asyncio.gather(*closers, return_exceptions=True), timeout=1
+            )
+            assert outcomes == ([cleanup_error, cleanup_error] if cleanup_fails else [None, None])
+            assert steps == ["iterator close", "response close", "client close"]
+        finally:
+            release.set()
+            await asyncio.gather(*closers, return_exceptions=True)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_repeated_cancellation_during_close_waits_for_cleanup(cleanup_fails):
+    from pytest_stream_lifecycle.streams import Stream
+
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        finished = asyncio.Event()
+        cleanup_tasks = set()
+        steps = []
+
+        class Iterator:
+            async def aclose(self):
+                cleanup_tasks.add(asyncio.current_task())
+                entered.set()
+                await release.wait()
+                steps.append("iterator close")
+                if cleanup_fails:
+                    error = RuntimeError("cancelled close finalizer")
+                    error.add_note("cancelled close note")
+                    raise error from ValueError("cancelled close cause")
+
+        class ResponseContext:
+            async def __aexit__(self, *args):
+                steps.append("response close")
+
+        class Client:
+            async def aclose(self):
+                steps.append("client close")
+                finished.set()
+
+        stream = Stream(Client(), ResponseContext(), None, Iterator(), 1, "cancelled")
+        close_task = asyncio.create_task(stream.aclose())
+        unrelated = asyncio.create_task(asyncio.Event().wait())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            close_task.cancel("first close cancellation")
+            await asyncio.sleep(0)  # Deliver the first cancellation before the next one.
+            close_task.cancel("second close cancellation")
+            await asyncio.sleep(0)
+            assert not close_task.done() and not finished.is_set()
+            release.set()
+            with pytest.raises(asyncio.CancelledError, match="first close cancellation") as caught:
+                await asyncio.wait_for(close_task, timeout=1)
+            assert finished.is_set()
+            assert steps == ["iterator close", "response close", "client close"]
+            if cleanup_fails:
+                notes = " ".join(caught.value.__notes__)
+                for detail in (
+                    "cancelled close finalizer",
+                    "cancelled close note",
+                    "cancelled close cause",
+                ):
+                    assert detail in notes
+            assert cleanup_tasks and all(task.done() for task in cleanup_tasks)
+            assert not unrelated.done()
+        finally:
+            release.set()
+            unrelated.cancel()
+            await asyncio.gather(close_task, unrelated, return_exceptions=True)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("primary_kind", ["timeout", "cancellation"])
+def test_pending_read_finalizer_preserves_primary_under_repeated_cancellation(primary_kind):
+    from pytest_stream_lifecycle.streams import Stream
+
+    async def scenario():
+        entered = asyncio.Event()
+        finalizing = asyncio.Event()
+        release = asyncio.Event()
+        operations = set()
+        steps = []
+
+        async def iterator():
+            operations.add(asyncio.current_task())
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+                yield "late"
+            finally:
+                finalizing.set()
+                await release.wait()
+                steps.append("read finalizer")
+                error = RuntimeError("pending read finalizer")
+                error.add_note("pending read note")
+                raise error from ValueError("pending read cause")
+
+        class ResponseContext:
+            async def __aexit__(self, *args):
+                steps.append("response close")
+
+        class Client:
+            async def aclose(self):
+                steps.append("client close")
+
+        stream = Stream(Client(), ResponseContext(), None, iterator(), 0.05, "read")
+        reader = asyncio.create_task(stream.next())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            if primary_kind == "cancellation":
+                reader.cancel("original read cancellation")
+            await asyncio.wait_for(finalizing.wait(), timeout=1)
+            reader.cancel("later read cancellation")
+            await asyncio.sleep(0)
+            reader.cancel("last read cancellation")
+            await asyncio.sleep(0)
+            assert not reader.done()
+            release.set()
+            expected = LifecycleError if primary_kind == "timeout" else asyncio.CancelledError
+            message = "timed out" if primary_kind == "timeout" else "original read cancellation"
+            with pytest.raises(expected, match=message) as caught:
+                await asyncio.wait_for(reader, timeout=1)
+            notes = " ".join(caught.value.__notes__)
+            for detail in ("pending read finalizer", "pending read note", "pending read cause"):
+                assert detail in notes
+            assert steps == ["read finalizer", "response close", "client close"]
+            assert operations and all(task.done() for task in operations)
+        finally:
+            release.set()
+            if not reader.done():
+                reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+            await asyncio.gather(*operations, return_exceptions=True)
+            await asyncio.gather(stream.aclose(), return_exceptions=True)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("cancel_caller", [False, True])
+def test_close_cancellation_at_cleanup_completion_preserves_primary(cancel_caller):
+    from pytest_stream_lifecycle.streams import Stream
+
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        steps = []
+        cleanup_error = asyncio.CancelledError("cleanup cancelled itself")
+
+        class Iterator:
+            async def aclose(self):
+                entered.set()
+                await release.wait()
+                raise cleanup_error
+
+        class ResponseContext:
+            async def __aexit__(self, *args):
+                steps.append("response close")
+
+        class Client:
+            async def aclose(self):
+                steps.append("client close")
+
+        stream = Stream(Client(), ResponseContext(), None, Iterator(), 1, "completion")
+        closer = asyncio.create_task(stream.aclose())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            # Queue cleanup completion first, then inject caller cancellation
+            # before either task resumes. Both outcomes are ready together.
+            release.set()
+            if cancel_caller:
+                closer.cancel("caller cancellation")
+            message = "caller cancellation" if cancel_caller else "cleanup cancelled itself"
+            with pytest.raises(asyncio.CancelledError, match=message) as caught:
+                await asyncio.wait_for(closer, timeout=1)
+            assert steps == ["response close", "client close"]
+            if cancel_caller:
+                assert any("cleanup cancelled itself" in note for note in caught.value.__notes__)
+            with pytest.raises(
+                asyncio.CancelledError, match="cleanup cancelled itself"
+            ) as repeated:
+                await stream.aclose()
+            assert repeated.value is cleanup_error
+        finally:
+            release.set()
+            await asyncio.gather(closer, return_exceptions=True)
+
+    run(scenario())
+
+
+def test_context_body_failure_joins_pending_real_socket_read():
+    async def scenario():
+        probe = LifecycleProbe()
+        release = asyncio.Event()
+        reader = None
+        failure = ValueError("body interrupted a pending read")
+        async with live_server(disconnect_app(probe, release=release)) as server:
+            try:
+                with pytest.raises(ValueError, match="body interrupted") as caught:
+                    async with server.sse("/") as stream:
+                        assert (await stream.next()).data == "one"
+                        assert (await stream.next()).data == "two"
+                        reader = asyncio.create_task(stream.next())
+
+                        async def iterator_running():
+                            while not stream._iterator.ag_running:
+                                assert not reader.done()
+                                await asyncio.sleep(0)
+
+                        await asyncio.wait_for(iterator_running(), timeout=1)
+                        raise failure
+                assert caught.value is failure
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(reader, timeout=1)
+                assert reader.cancelling() == 0
+                assert stream._read_task.done() and stream._close_task.done()
+                # Check instrumented cleanup before server teardown can hide it.
+                await probe.wait_closed("producer", "upstream", timeout=1)
+            finally:
+                release.set()
+                if reader is not None:
+                    if not reader.done():
+                        reader.cancel()
+                    await asyncio.gather(reader, return_exceptions=True)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("cancel_caller", [False, True])
+def test_iterator_cancellation_preserves_diagnostics_and_caller_priority(cancel_caller):
+    from pytest_stream_lifecycle.streams import Stream
+
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        steps = []
+        cause = ValueError("iterator cancellation cause")
+        diagnostic = asyncio.CancelledError("iterator cancellation detail")
+        diagnostic.add_note("iterator cancellation note")
+        diagnostic.__cause__ = cause
+
+        class Iterator:
+            async def __anext__(self):
+                entered.set()
+                await release.wait()
+                raise diagnostic
+
+            async def aclose(self):
+                steps.append("iterator close")
+
+        class ResponseContext:
+            async def __aexit__(self, *args):
+                steps.append("response close")
+
+        class Client:
+            async def aclose(self):
+                steps.append("client close")
+
+        stream = Stream(Client(), ResponseContext(), None, Iterator(), 5, "diagnostic")
+
+        async def caller():
+            try:
+                await stream.next()
+            except asyncio.CancelledError as exc:
+                return exc
+            pytest.fail("iterator cancellation was not raised")
+
+        reader = asyncio.create_task(caller())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            release.set()
+            if cancel_caller:
+                # Queue the iterator's diagnostic failure before the cancelled
+                # caller resumes; the caller's cancellation remains primary.
+                reader.cancel("caller cancellation detail")
+            error = await asyncio.wait_for(reader, timeout=1)
+            if cancel_caller:
+                assert str(error) == "caller cancellation detail"
+                notes = " ".join(getattr(error, "__notes__", ()))
+                for detail in (
+                    "iterator cancellation detail",
+                    "iterator cancellation cause",
+                    "iterator cancellation note",
+                ):
+                    assert detail in notes
+            else:
+                assert error is diagnostic
+                assert error.__cause__ is cause
+                assert "iterator cancellation note" in error.__notes__
+            assert steps == ["iterator close", "response close", "client close"]
+            assert stream._read_task.done() and stream._close_task.done()
+        finally:
+            release.set()
+            if not reader.done():
+                reader.cancel()
+            await asyncio.gather(reader, stream.aclose(), return_exceptions=True)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("replace_cancellation", [False, True])
+def test_pending_read_diagnostic_cancellation_is_not_success(replace_cancellation):
+    from pytest_stream_lifecycle.streams import Stream
+
+    async def scenario():
+        entered = asyncio.Event()
+        diagnostics = []
+        cause = ValueError("read finalizer cancellation cause")
+        steps = []
+
+        async def iterator():
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+                yield "late"
+            except asyncio.CancelledError as exc:
+                error = (
+                    asyncio.CancelledError("read finalizer cancellation")
+                    if replace_cancellation
+                    else exc
+                )
+                error.add_note("read finalizer cancellation note")
+                diagnostics.append(error)
+                raise error from cause
+            finally:
+                steps.append("read finalizer")
+
+        class ResponseContext:
+            async def __aexit__(self, *args):
+                steps.append("response close")
+
+        class Client:
+            async def aclose(self):
+                steps.append("client close")
+
+        stream = Stream(Client(), ResponseContext(), None, iterator(), 5, "finalizer")
+
+        async def caller():
+            try:
+                await stream.next()
+            except asyncio.CancelledError as exc:
+                return exc
+            pytest.fail("pending read was not interrupted")
+
+        reader = asyncio.create_task(caller())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await stream.aclose()
+            assert caught.value is diagnostics[0]
+            assert caught.value.__cause__ is cause
+            assert "read finalizer cancellation note" in caught.value.__notes__
+            assert await asyncio.wait_for(reader, timeout=1) is diagnostics[0]
+            with pytest.raises(asyncio.CancelledError) as repeated:
+                await stream.aclose()
+            assert repeated.value is diagnostics[0]
+            assert steps == ["read finalizer", "response close", "client close"]
+            assert stream._read_task.done() and stream._close_task.done()
+        finally:
+            if not reader.done():
+                reader.cancel()
+            await asyncio.gather(reader, stream.aclose(), return_exceptions=True)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "close"])
+def test_read_completion_race_preserves_caller_cancellation(outcome):
+    from pytest_stream_lifecycle.streams import Stream
+
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        steps = []
+        cause = ValueError("completed read cause")
+        failure = RuntimeError("completed read failure")
+        failure.add_note("completed read note")
+
+        class Iterator:
+            async def __anext__(self):
+                entered.set()
+                try:
+                    await release.wait()
+                    if outcome == "failure":
+                        raise failure from cause
+                    if outcome == "close":
+                        await asyncio.Event().wait()
+                    return "completed read value"
+                finally:
+                    steps.append("read finalizer")
+
+            async def aclose(self):
+                steps.append("iterator close")
+
+        class ResponseContext:
+            async def __aexit__(self, *args):
+                steps.append("response close")
+
+        class Client:
+            async def aclose(self):
+                steps.append("client close")
+
+        stream = Stream(Client(), ResponseContext(), None, Iterator(), 5, "completion race")
+
+        async def caller():
+            try:
+                return await stream.next()
+            except (asyncio.CancelledError, LifecycleError) as exc:
+                return exc
+
+        reader = asyncio.create_task(caller())
+        unrelated = asyncio.create_task(asyncio.Event().wait())
+        closer = None
+        try:
+            async with asyncio.timeout(1):
+                await entered.wait()
+            # Shield's callback runs first and completes its future. Cancel the
+            # caller next, before it resumes: Python 3.11 wait_for loses this
+            # cancellation when it sees that completed future.
+            stream._read_task.add_done_callback(
+                lambda _: reader.cancel("caller completion-race cancellation")
+            )
+            release.set()
+            if outcome == "close":
+                closer = asyncio.create_task(stream.aclose())
+            async with asyncio.timeout(1):
+                error = await reader
+                if closer is not None:
+                    await closer
+            assert isinstance(error, asyncio.CancelledError)
+            assert str(error) == "caller completion-race cancellation"
+            if outcome == "failure":
+                notes = " ".join(getattr(error, "__notes__", ()))
+                for detail in (
+                    "completed read failure",
+                    "completed read cause",
+                    "completed read note",
+                ):
+                    assert detail in notes
+            assert steps == ["read finalizer", "iterator close", "response close", "client close"]
+            assert stream._read_task.done() and stream._close_task.done()
+            assert not unrelated.done() and unrelated.cancelling() == 0
+        finally:
+            release.set()
+            tasks = [reader, unrelated]
+            if closer is not None:
+                tasks.append(closer)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, stream.aclose(), return_exceptions=True)
+
+    run(scenario())

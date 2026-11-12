@@ -97,6 +97,21 @@ async def _stop(
     timeout: float,
     task_errors: list[BaseException],
 ) -> None:
+    def close_connections() -> None:
+        # Stop admission before taking the forced-cleanup task snapshot.
+        for listener in getattr(server, "servers", ()):
+            listener.close()
+        for connection in tuple(server.server_state.connections):
+            transport = getattr(connection, "transport", None)
+            if transport is not None:
+                transport.abort()
+        sock.close()
+
+    def owned_tasks() -> set[asyncio.Task[Any]]:
+        # Uvicorn registers request tasks before tracked_app starts running.
+        requests = getattr(server.server_state, "tasks", ())
+        return {owned for owned in {*app_tasks, *requests, task} if not owned.done()}
+
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     server.should_exit = True
@@ -108,13 +123,16 @@ async def _stop(
         done, pending = await asyncio.wait({task}, timeout=grace)
         if pending:
             timed_out = True
-            server.force_exit = True
-            task.cancel()
-        owned = {t for t in app_tasks if not t.done()} | set(pending)
+        # Serving has ended or exhausted its grace period. Close admission
+        # before draining application work, including startup failure paths.
+        server.force_exit = True
+        close_connections()
+        owned = owned_tasks()
         if owned and not timed_out:
             _, owned = await asyncio.wait(owned, timeout=max(0, grace_deadline - loop.time()))
             timed_out = bool(owned)
         if owned:
+            owned = owned_tasks()
             for owned_task in owned:
                 owned_task.cancel()
             completed, _ = await asyncio.wait(owned, timeout=max(0, deadline - loop.time()))
@@ -143,13 +161,7 @@ async def _stop(
         # Uvicorn's asyncio.Server normally owns the supplied socket. If its
         # serve task was cancelled mid-shutdown, close its listener explicitly
         # before closing the original socket, and never touch other servers.
-        for listener in getattr(server, "servers", ()):
-            listener.close()
-        for connection in tuple(server.server_state.connections):
-            transport = getattr(connection, "transport", None)
-            if transport is not None:
-                transport.abort()
-        sock.close()
+        close_connections()
 
 
 @asynccontextmanager
@@ -172,7 +184,10 @@ async def live_server(
     app_tasks: set[asyncio.Task[Any]] = set()
     task_errors: list[BaseException] = []
     lifespan_started = False
+    startup_succeeded = False
     startup_failure: BaseException | str | None = None
+    startup_evidence: list[BaseException | str] = []
+    reported_startup_failure: BaseException | str | None = None
     lifespan_failure: BaseException | str | None = None
 
     async def tracked_app(scope, receive, send):
@@ -190,6 +205,12 @@ async def live_server(
 
             current.add_done_callback(task_done)
         if scope["type"] != "lifespan":
+            if server is not None and server.force_exit:
+                # A previously accepted connection may have callbacks queued
+                # when its listener closes. Do not enter user code afterward.
+                await send({"type": "http.response.start", "status": 503, "headers": []})
+                await send({"type": "http.response.body", "body": b""})
+                return
             try:
                 await app(scope, receive, send)
             except BaseException as exc:
@@ -208,6 +229,7 @@ async def live_server(
                 lifespan_started = True
             elif message["type"] == "lifespan.startup.failed":
                 startup_failure = message.get("message") or "application reported startup failure"
+                startup_evidence.append(startup_failure)
             elif message["type"] == "lifespan.shutdown.failed":
                 lifespan_failure = message.get("message") or "application reported shutdown failure"
             await send(message)
@@ -215,11 +237,20 @@ async def live_server(
         try:
             await app(scope, receive, tracked_send)
         except BaseException as exc:
-            if not isinstance(exc, asyncio.CancelledError):
+            plain_cancellation = (
+                type(exc) is asyncio.CancelledError
+                and not exc.args
+                and exc.__cause__ is None
+                and exc.__context__ is None
+                and not getattr(exc, "__notes__", ())
+            )
+            if not plain_cancellation:
                 if lifespan_started:
                     lifespan_failure = exc
-                elif startup_failure is None:
-                    startup_failure = exc
+                else:
+                    startup_evidence.append(exc)
+                    if startup_failure is None:
+                        startup_failure = exc
             raise
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -260,11 +291,13 @@ async def live_server(
             await _wait_until_started(server, task, startup_timeout)
         except ServerError:
             if startup_failure is not None:
+                reported_startup_failure = startup_failure
                 detail = f"application lifespan startup failed: {startup_failure}"
                 if isinstance(startup_failure, BaseException):
                     raise ServerError(detail) from startup_failure
                 raise ServerError(detail) from None
             raise
+        startup_succeeded = True
         yield ServerHandle(url=f"http://127.0.0.1:{port}")
     except BaseException as exc:
         failure = exc
@@ -278,17 +311,30 @@ async def live_server(
                     await _stop(server, task, sock, app_tasks, shutdown_timeout, task_errors)
                 except Exception as exc:  # noqa: BLE001 - preserve cleanup failure
                     cleanup_error = exc
+                # Collect after _stop even when it fails: finalizers can record
+                # additional startup messages or exceptions during cancellation.
+                # Ignore unsupported-lifespan evidence only after successful
+                # entry, not merely because Uvicorn starts during cleanup.
+                failures = []
+                if not startup_succeeded:
+                    failures.extend(
+                        ("application lifespan startup failed", evidence)
+                        for evidence in startup_evidence
+                        if evidence is not reported_startup_failure
+                    )
                 if lifespan_failure is not None:
-                    detail = f"application lifespan failed after startup: {lifespan_failure}"
+                    failures.append(("application lifespan failed after startup", lifespan_failure))
+                for label, evidence in failures:
+                    detail = f"{label}: {evidence}"
                     if cleanup_error is not None:
-                        if isinstance(lifespan_failure, BaseException):
-                            add_exception_notes(cleanup_error, detail, lifespan_failure)
+                        if isinstance(evidence, BaseException):
+                            add_exception_notes(cleanup_error, detail, evidence)
                         else:
                             cleanup_error.add_note(detail)
-                    elif isinstance(lifespan_failure, BaseException):
-                        raise ServerError(detail) from lifespan_failure
                     else:
-                        raise ServerError(detail)
+                        cleanup_error = ServerError(detail)
+                        if isinstance(evidence, BaseException):
+                            cleanup_error.__cause__ = evidence
                 if cleanup_error is not None:
                     raise cleanup_error
 

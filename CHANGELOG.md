@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.0a2 — 2026-11-12
+
+- Preserve failed-startup finalizer exceptions, causes, and notes without replacing
+  startup timeouts or caller cancellation; retain automatic lifespan fallback.
+- Stop request admission before forced cleanup and include Uvicorn's already
+  scheduled request tasks in the bounded, server-owned shutdown set.
+- Coordinate pending stream reads and overlapping closes through one cleanup
+  operation; preserve primary failures through repeated caller cancellation.
+- Accept case-insensitive SSE media types while preserving their parameters.
+- Report recorded lifecycle failures even when the exception is falsy.
+
 ## 0.1.0a1 — 2026-11-12
 
 First experimental alpha; the public API may change.

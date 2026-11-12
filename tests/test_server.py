@@ -672,3 +672,466 @@ def test_stop_preserves_all_owned_task_failures(server_fails):
             assert detail in details
 
     run(scenario())
+
+
+@pytest.mark.parametrize("lifespan", ["on", "auto"])
+@pytest.mark.parametrize("startup_kind", ["timeout", "cancellation", "reported", "immediate"])
+def test_failed_startup_preserves_finalizer_evidence(lifespan, startup_kind):
+    async def scenario():
+        entered = asyncio.Event()
+        application_tasks = set()
+
+        async def app(scope, receive, send):
+            application_tasks.add(asyncio.current_task())
+            await receive()
+            entered.set()
+            try:
+                if startup_kind in ("reported", "immediate"):
+                    await send({"type": "lifespan.startup.failed", "message": "startup detail"})
+                if startup_kind != "immediate":
+                    await asyncio.Event().wait()
+            finally:
+                error = RuntimeError("startup finalizer exploded")
+                error.add_note("startup finalizer note")
+                raise error from ValueError("startup finalizer cause")
+
+        async def host():
+            async with live_server(
+                app, lifespan=lifespan, startup_timeout=0.05, shutdown_timeout=0.2
+            ):
+                pytest.fail("startup unexpectedly succeeded")
+
+        unrelated = asyncio.create_task(asyncio.Event().wait())
+        host_task = asyncio.create_task(host())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            if startup_kind == "cancellation":
+                host_task.cancel("startup interrupted")
+                expected, message = asyncio.CancelledError, "startup interrupted"
+            else:
+                expected = ServerError
+                message = "startup timed out" if startup_kind == "timeout" else "startup detail"
+            with pytest.raises(expected, match=message) as caught:
+                await asyncio.wait_for(host_task, timeout=2)
+            notes = " ".join(getattr(caught.value, "__notes__", ()))
+            for detail in (
+                "startup finalizer exploded",
+                "startup finalizer note",
+                "startup finalizer cause",
+            ):
+                assert detail in notes
+            assert application_tasks and all(task.done() for task in application_tasks)
+            assert not unrelated.done()
+        finally:
+            for task in {host_task, unrelated, *application_tasks}:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(host_task, unrelated, *application_tasks, return_exceptions=True)
+
+    run(scenario())
+
+
+def test_forced_shutdown_stops_admission_before_waiting_for_finalizers(monkeypatch):
+    import pytest_stream_lifecycle.server as server_module
+
+    instances = []
+
+    class BlockedServer(server_module._Server):
+        def __init__(self, config):
+            super().__init__(config)
+            instances.append(self)
+
+        async def main_loop(self):
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(server_module, "_Server", BlockedServer)
+
+    async def scenario():
+        ready = asyncio.get_running_loop().create_future()
+        leave_context = asyncio.Event()
+        cancelling_lifespan = asyncio.Event()
+        release_lifespan = asyncio.Event()
+        request_entered = asyncio.Event()
+        request_cleaned = asyncio.Event()
+        release_request = asyncio.Event()
+        application_tasks = set()
+
+        async def app(scope, receive, send):
+            application_tasks.add(asyncio.current_task())
+            if scope["type"] == "lifespan":
+                await receive()
+                await send({"type": "lifespan.startup.complete"})
+                try:
+                    await receive()
+                finally:
+                    cancelling_lifespan.set()
+                    await release_lifespan.wait()
+            else:
+                request_entered.set()
+                try:
+                    await release_request.wait()
+                finally:
+                    request_cleaned.set()
+
+        async def host():
+            async with live_server(app, shutdown_timeout=1) as server:
+                ready.set_result(server.url)
+                await leave_context.wait()
+
+        host_task = asyncio.create_task(host())
+        unrelated = asyncio.create_task(asyncio.Event().wait())
+        writer = None
+        witnesses = []
+        try:
+            url = await asyncio.wait_for(ready, timeout=1)
+            port = int(url.rsplit(":", 1)[1])
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+
+            async def accepted():
+                while not instances[0].server_state.connections:
+                    await asyncio.sleep(0)  # Scheduler checkpoint, not a timing delay.
+
+            await asyncio.wait_for(accepted(), timeout=1)
+            leave_context.set()
+            await asyncio.wait_for(cancelling_lifespan.wait(), timeout=2)
+            # The old implementation has frozen app_tasks but still accepts a
+            # request on this existing connection while lifespan cleanup waits.
+            try:
+                writer.write(b"GET /late HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                await writer.drain()
+            except ConnectionError:
+                pass
+
+            async def disconnected():
+                try:
+                    return await reader.read(1)
+                except ConnectionError:
+                    return b""
+
+            witnesses = [
+                asyncio.create_task(request_entered.wait()),
+                asyncio.create_task(disconnected()),
+            ]
+            done, _ = await asyncio.wait(witnesses, timeout=1, return_when=asyncio.FIRST_COMPLETED)
+            assert done, "neither request admission nor transport closure was observed"
+            release_lifespan.set()
+            with pytest.raises(ServerError, match="shutdown timed out"):
+                await asyncio.wait_for(host_task, timeout=2)
+            assert not request_entered.is_set() or request_cleaned.is_set()
+            assert all(task.done() for task in application_tasks)
+            assert not instances[0].server_state.tasks
+            assert not unrelated.done()
+            await assert_port_closed(url)
+        finally:
+            leave_context.set()
+            release_lifespan.set()
+            release_request.set()
+            for task in [*witnesses, unrelated]:
+                task.cancel()
+            await asyncio.gather(*witnesses, unrelated, return_exceptions=True)
+            if not host_task.done():
+                host_task.cancel()
+            await asyncio.gather(host_task, return_exceptions=True)
+            await asyncio.gather(*application_tasks, return_exceptions=True)
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except ConnectionError:
+                    pass
+
+    run(scenario())
+
+
+def test_forced_shutdown_cancels_scheduled_owned_uvicorn_request(monkeypatch):
+    from uvicorn.protocols.http.h11_impl import RequestResponseCycle
+
+    import pytest_stream_lifecycle.server as server_module
+
+    class BlockedServer(server_module._Server):
+        async def main_loop(self):
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(server_module, "_Server", BlockedServer)
+
+    async def scenario():
+        scheduled = asyncio.Event()
+        release = asyncio.Event()
+        cleaned = asyncio.Event()
+        request_tasks = set()
+        original = RequestResponseCycle.run_asgi
+
+        async def gated_request(self, app):
+            request_tasks.add(asyncio.current_task())
+            scheduled.set()
+            try:
+                await release.wait()
+                await original(self, app)
+            finally:
+                cleaned.set()
+
+        monkeypatch.setattr(RequestResponseCycle, "run_asgi", gated_request)
+        writer = None
+        unrelated = asyncio.create_task(asyncio.Event().wait())
+        try:
+            with pytest.raises(ServerError, match="shutdown timed out"):
+                async with live_server(app_with_events([]), shutdown_timeout=0.2) as server:
+                    port = int(server.url.rsplit(":", 1)[1])
+                    _, writer = await asyncio.open_connection("127.0.0.1", port)
+                    writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    await writer.drain()
+                    await asyncio.wait_for(scheduled.wait(), timeout=1)
+            assert cleaned.is_set()
+            assert request_tasks and all(task.done() for task in request_tasks)
+            assert not unrelated.done()
+        finally:
+            release.set()
+            for task in {*request_tasks, unrelated}:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*request_tasks, unrelated, return_exceptions=True)
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except ConnectionError:
+                    pass
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("failure_kind", ["exception", "message", "diagnostic-cancellation"])
+def test_recorded_startup_failure_survives_caller_cancellation(failure_kind):
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        finalizing = asyncio.Event()
+        application_tasks = set()
+        cause = ValueError("recorded startup finalizer cause")
+        failure_type = (
+            asyncio.CancelledError if failure_kind == "diagnostic-cancellation" else RuntimeError
+        )
+        failure = failure_type("recorded startup finalizer detail")
+        failure.add_note("recorded startup finalizer note")
+
+        async def app(scope, receive, send):
+            application_tasks.add(asyncio.current_task())
+            await receive()
+            entered.set()
+            try:
+                await release.wait()
+            finally:
+                # No await between this signal and the failure: tracked_app
+                # records it before the caller resumes and starts cleanup.
+                finalizing.set()
+                if failure_kind != "message":
+                    raise failure from cause
+                await send(
+                    {"type": "lifespan.startup.failed", "message": "recorded startup message"}
+                )
+
+        async def host():
+            async with live_server(app, startup_timeout=1, shutdown_timeout=0.2):
+                pytest.fail("startup unexpectedly succeeded")
+
+        host_task = asyncio.create_task(host())
+        unrelated = asyncio.create_task(asyncio.Event().wait())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            release.set()
+            await finalizing.wait()
+            host_task.cancel("startup caller cancellation")
+            with pytest.raises(
+                asyncio.CancelledError, match="startup caller cancellation"
+            ) as caught:
+                await asyncio.wait_for(host_task, timeout=1)
+            notes = " ".join(getattr(caught.value, "__notes__", ()))
+            details = (
+                (
+                    "recorded startup finalizer detail",
+                    "recorded startup finalizer cause",
+                    "recorded startup finalizer note",
+                )
+                if failure_kind != "message"
+                else ("recorded startup message",)
+            )
+            assert all(detail in notes for detail in details)
+            assert application_tasks and all(task.done() for task in application_tasks)
+            assert not unrelated.done()
+        finally:
+            release.set()
+            if not host_task.done():
+                host_task.cancel()
+            unrelated.cancel()
+            await asyncio.gather(host_task, unrelated, *application_tasks, return_exceptions=True)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("lifespan", ["on", "auto"])
+@pytest.mark.parametrize("primary_kind", ["timeout", "cancellation", "reported"])
+@pytest.mark.parametrize("cancellation_kind", ["plain", "diagnostic", "annotated"])
+def test_startup_cancellation_evidence_during_cleanup(lifespan, primary_kind, cancellation_kind):
+    async def scenario():
+        entered = asyncio.Event()
+        application_tasks = set()
+
+        async def app(scope, receive, send):
+            application_tasks.add(asyncio.current_task())
+            await receive()
+            entered.set()
+            if primary_kind == "reported":
+                await send(
+                    {"type": "lifespan.startup.failed", "message": "original startup failure"}
+                )
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as exc:
+                if cancellation_kind == "plain":
+                    raise
+                error = (
+                    asyncio.CancelledError("startup diagnostic cancellation")
+                    if cancellation_kind == "diagnostic"
+                    else exc
+                )
+                error.add_note("startup cancellation finalizer note")
+                raise error from ValueError("startup cancellation finalizer cause")
+
+        async def host():
+            async with live_server(
+                app, lifespan=lifespan, startup_timeout=0.04, shutdown_timeout=0.2
+            ):
+                pytest.fail("startup unexpectedly succeeded")
+
+        host_task = asyncio.create_task(host())
+        unrelated = asyncio.create_task(asyncio.Event().wait())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            if primary_kind == "cancellation":
+                host_task.cancel("original caller cancellation")
+                expected, message = asyncio.CancelledError, "original caller cancellation"
+            else:
+                expected = ServerError
+                message = (
+                    "startup timed out" if primary_kind == "timeout" else "original startup failure"
+                )
+            with pytest.raises(expected, match=message) as caught:
+                await asyncio.wait_for(host_task, timeout=2)
+            notes = " ".join(getattr(caught.value, "__notes__", ()))
+            if cancellation_kind == "plain":
+                assert "CancelledError" not in notes
+            else:
+                assert "startup cancellation finalizer note" in notes
+                assert "startup cancellation finalizer cause" in notes
+                if cancellation_kind == "diagnostic":
+                    assert "startup diagnostic cancellation" in notes
+            assert application_tasks and all(task.done() for task in application_tasks)
+            assert not unrelated.done()
+        finally:
+            for task in {host_task, unrelated, *application_tasks}:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(host_task, unrelated, *application_tasks, return_exceptions=True)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("lifespan", ["on", "auto"])
+@pytest.mark.parametrize("primary_kind", ["timeout", "cancellation"])
+@pytest.mark.parametrize("finalizer_raises", [False, True])
+def test_startup_messages_during_cleanup_are_retained(lifespan, primary_kind, finalizer_raises):
+    async def scenario():
+        entered = asyncio.Event()
+        application_tasks = set()
+
+        async def app(scope, receive, send):
+            application_tasks.add(asyncio.current_task())
+            await receive()
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await send(
+                    {"type": "lifespan.startup.failed", "message": "late startup failure message"}
+                )
+                if finalizer_raises:
+                    error = RuntimeError("late startup finalizer exception")
+                    error.add_note("late startup finalizer note")
+                    raise error from ValueError("late startup finalizer cause")
+
+        async def host():
+            async with live_server(
+                app, lifespan=lifespan, startup_timeout=0.04, shutdown_timeout=0.2
+            ):
+                pytest.fail("startup unexpectedly succeeded")
+
+        host_task = asyncio.create_task(host())
+        unrelated = asyncio.create_task(asyncio.Event().wait())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            if primary_kind == "cancellation":
+                host_task.cancel("original caller cancellation")
+                expected, message = asyncio.CancelledError, "original caller cancellation"
+            else:
+                expected, message = ServerError, "startup timed out"
+            with pytest.raises(expected, match=message) as caught:
+                await asyncio.wait_for(host_task, timeout=2)
+            notes = " ".join(getattr(caught.value, "__notes__", ()))
+            assert "late startup failure message" in notes
+            if finalizer_raises:
+                for detail in (
+                    "late startup finalizer exception",
+                    "late startup finalizer note",
+                    "late startup finalizer cause",
+                ):
+                    assert detail in notes
+            assert application_tasks and all(task.done() for task in application_tasks)
+            assert not unrelated.done()
+        finally:
+            for task in {host_task, unrelated, *application_tasks}:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(host_task, unrelated, *application_tasks, return_exceptions=True)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("primary_kind", ["body", "cancellation"])
+def test_successful_auto_fallback_does_not_pollute_body_failure(primary_kind):
+    async def scenario():
+        entered = asyncio.Event()
+        application_tasks = set()
+
+        async def app(scope, receive, send):
+            application_tasks.add(asyncio.current_task())
+            assert scope["type"] == "lifespan"
+            raise RuntimeError("unsupported lifespan fallback evidence")
+
+        async def host():
+            async with live_server(app, lifespan="auto"):
+                entered.set()
+                if primary_kind == "body":
+                    raise ValueError("body failure after fallback")
+                await asyncio.Event().wait()
+
+        host_task = asyncio.create_task(host())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            if primary_kind == "cancellation":
+                host_task.cancel("body cancellation after fallback")
+                expected = asyncio.CancelledError
+            else:
+                expected = ValueError
+            with pytest.raises(expected, match="after fallback") as caught:
+                await asyncio.wait_for(host_task, timeout=2)
+            assert "unsupported lifespan fallback evidence" not in " ".join(
+                getattr(caught.value, "__notes__", ())
+            )
+            assert caught.value.__cause__ is None
+            assert application_tasks and all(task.done() for task in application_tasks)
+        finally:
+            if not host_task.done():
+                host_task.cancel()
+            await asyncio.gather(host_task, *application_tasks, return_exceptions=True)
+
+    run(scenario())

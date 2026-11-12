@@ -1,6 +1,6 @@
 # Releasing
 
-Current candidate: **0.1.0a1**, an experimental alpha. Preparing this workflow or
+Current candidate: **0.1.0a2**, an experimental alpha. Preparing this workflow or
 running its default `check` mode does not upload anything to PyPI or TestPyPI.
 Do not claim a release exists until its index page and a fresh install have been
 verified. The repository's GitHub releases and Python package indices are
@@ -64,13 +64,13 @@ GitHub environments are configured:
    install instructions. Keep the alpha version unless stability has actually
    been established. Re-run `check` on that exact commit.
 2. Create and push an annotated tag matching the version, for example
-   `v0.1.0a1`, on the reviewed commit in `main`'s history. Do not move a published
+   `v0.1.0a2`, on the reviewed commit in `main`'s history. Do not move a published
    version's tag. The workflow checks tag/version agreement and main ancestry.
 3. Run the workflow on the tag with `target=testpypi`, review the tests and build,
    then approve the TestPyPI environment deployment. Example:
 
    ```sh
-   gh workflow run release.yml --ref v0.1.0a1 -f target=testpypi
+   gh workflow run release.yml --ref v0.1.0a2 -f target=testpypi
    ```
 
 4. Verify the TestPyPI project, version, artifact hashes and provenance. In a
@@ -79,7 +79,7 @@ GitHub environments are configured:
 
    ```sh
    python -m pip install 'pytest>=8,<10' 'uvicorn>=0.30,<1' 'httpx>=0.27,<1' 'httpx-sse>=0.4,<0.5'
-   python -m pip install --no-deps --index-url https://test.pypi.org/simple/ pytest-stream-lifecycle==0.1.0a1
+   python -m pip install --no-deps --index-url https://test.pypi.org/simple/ pytest-stream-lifecycle==0.1.0a2
    python -m pip check
    ```
 
@@ -93,7 +93,7 @@ GitHub environments are configured:
    download hashes/provenance and a clean installation:
 
    ```sh
-   python -m pip install pytest-stream-lifecycle==0.1.0a1
+   python -m pip install pytest-stream-lifecycle==0.1.0a2
    python -m pip check
    ```
 
